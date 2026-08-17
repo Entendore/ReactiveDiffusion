@@ -95,13 +95,15 @@ except ImportError:
     def jit(*args, **kwargs):
         def decorator(func): return func
         return decorator
+    def prange(*args, **kwargs):
+        return range(*args)
 
 warnings.filterwarnings('ignore')
 
 log.info("Backend detection: CuPy GPU=%s, Numba CPU=%s", GPU_AVAILABLE, NUMBA_AVAILABLE)
 
 @jit(nopython=True, parallel=True, cache=True, fastmath=True)
-def numba_step_general(U_src, V_src, U_dst, V_dst, Du_x, Du_y, Dv_x, Dv_y, 
+def numba_step_general(U_src, V_src, U_dst, V_dst, Du_x, Du_y, Dv_x, Dv_y,
                        F_fld, k_fld, dt, bc_type, use_9pt):
     rows, cols = U_src.shape
     for i in prange(rows):
@@ -147,7 +149,7 @@ class SimulationEngine:
         self.height = height
         self.use_gpu = use_gpu and GPU_AVAILABLE
         self.mutex = QMutex()
-        
+
         self.F = 0.0545
         self.k = 0.0620
         self.Du_x, self.Du_y = 0.2, 0.2
@@ -155,10 +157,10 @@ class SimulationEngine:
         self.boundary = 0
         self.use_9pt = False
         self.noise_level = 0.0
-        
+
         self.F_gradient = None
         self.k_gradient = None
-        
+
         self.iteration = 0
         log.info("Engine created: %dx%d, backend=%s", width, height, "GPU" if self.use_gpu else "CPU")
         self.reset()
@@ -181,24 +183,26 @@ class SimulationEngine:
             t = lib.linspace(0, 1, self.width)
             grad = lib.tile(t, (self.height, 1))
             self.F_field = self.F + (grad - 0.5) * self.F_gradient
-            log.debug("F gradient rebuilt: center=%.4f range=±%.4f", self.F, self.F_gradient * 0.5)
+            log.debug("F field rebuilt with gradient: center=%.4f range=±%.4f", self.F, self.F_gradient * 0.5)
         else:
             self.F_field = lib.full((self.height, self.width), self.F, dtype=np.float32)
-            
+            log.debug("F field rebuilt uniform: F=%.4f", self.F)
+
         if self.k_gradient is not None:
             t = lib.linspace(0, 1, self.width)
             grad = lib.tile(t, (self.height, 1))
             self.k_field = self.k + (grad - 0.5) * self.k_gradient
-            log.debug("k gradient rebuilt: center=%.4f range=±%.4f", self.k, self.k_gradient * 0.5)
+            log.debug("k field rebuilt with gradient: center=%.4f range=±%.4f", self.k, self.k_gradient * 0.5)
         else:
             self.k_field = lib.full((self.height, self.width), self.k, dtype=np.float32)
+            log.debug("k field rebuilt uniform: k=%.4f", self.k)
 
     def reset(self, seed='Multi-Random', image_path=None):
         with QMutexLocker(self.mutex):
             self._allocate_arrays()
             lib = self._lib()
             self.iteration = 0
-            
+
             y, x = lib.meshgrid(lib.arange(self.height), lib.arange(self.width), indexing='ij')
             cx, cy = self.width // 2, self.height // 2
             r = self.height // 8
@@ -287,7 +291,7 @@ class SimulationEngine:
     def step(self, steps=10, dt=1.0):
         max_D = max(self.Du_x, self.Du_y, self.Dv_x, self.Dv_y)
         dt = min(dt, 0.9 / (2.0 * max_D)) if max_D > 0 else dt
-        
+
         with QMutexLocker(self.mutex):
             if self.use_gpu:
                 self._step_gpu(steps, dt)
@@ -297,15 +301,15 @@ class SimulationEngine:
 
     def _step_gpu(self, steps, dt):
         pad_mode = 'wrap' if self.boundary == 1 else 'edge'
-        
+
         for _ in range(steps):
             U_pad = cp.pad(self.U_src, 1, mode=pad_mode)
             V_pad = cp.pad(self.V_src, 1, mode=pad_mode)
-            
+
             U_c = U_pad[1:-1, 1:-1]
             U_n, U_s = U_pad[:-2, 1:-1], U_pad[2:, 1:-1]
             U_e, U_w = U_pad[1:-1, 2:], U_pad[1:-1, :-2]
-            
+
             V_c = V_pad[1:-1, 1:-1]
             V_n, V_s = V_pad[:-2, 1:-1], V_pad[2:, 1:-1]
             V_e, V_w = V_pad[1:-1, 2:], V_pad[1:-1, :-2]
@@ -317,7 +321,7 @@ class SimulationEngine:
                 U_ne, U_nw = U_pad[:-2, 2:], U_pad[:-2, :-2]
                 U_se, U_sw = U_pad[2:, 2:], U_pad[2:, :-2]
                 Lu += 0.05 * (self.Du_x + self.Du_y) * (U_ne + U_nw + U_se + U_sw - 4*U_c)
-                
+
                 V_ne, V_nw = V_pad[:-2, 2:], V_pad[:-2, :-2]
                 V_se, V_sw = V_pad[2:, 2:], V_pad[2:, :-2]
                 Lv += 0.05 * (self.Dv_x + self.Dv_y) * (V_ne + V_nw + V_se + V_sw - 4*V_c)
@@ -325,10 +329,13 @@ class SimulationEngine:
             uvv = self.U_src * self.V_src * self.V_src
             self.U_dst = self.U_src + (Lu - uvv + self.F_field * (1 - self.U_src)) * dt
             self.V_dst = self.V_src + (Lv + uvv - (self.F_field + self.k_field) * self.V_src) * dt
-            
+
             if self.noise_level > 0:
                 self.U_dst += cp.random.normal(0, self.noise_level, self.U_src.shape).astype(cp.float32) * dt
                 self.V_dst += cp.random.normal(0, self.noise_level, self.V_src.shape).astype(cp.float32) * dt
+
+            cp.clip(self.U_dst, 0.0, 1.0, out=self.U_dst)
+            cp.clip(self.V_dst, 0.0, 1.0, out=self.V_dst)
 
             self.U_src, self.U_dst = self.U_dst, self.U_src
             self.V_src, self.V_dst = self.V_dst, self.V_src
@@ -340,14 +347,17 @@ class SimulationEngine:
                                self.F_field, self.k_field, dt, self.boundary, self.use_9pt)
             self.U_src, self.U_dst = self.U_dst, self.U_src
             self.V_src, self.V_dst = self.V_dst, self.V_src
-            
+
             if self.noise_level > 0:
                 noise_u = np.random.normal(0, self.noise_level, self.U_src.shape).astype(np.float32) * dt
                 noise_v = np.random.normal(0, self.noise_level, self.V_src.shape).astype(np.float32) * dt
                 self.U_src += noise_u
                 self.V_src += noise_v
 
-    def get_image(self, colormap=cv2.COLORMAP_INFERNO, gamma=0.6, sharpen=False, 
+            np.clip(self.U_src, 0.0, 1.0, out=self.U_src)
+            np.clip(self.V_src, 0.0, 1.0, out=self.V_src)
+
+    def get_image(self, colormap=cv2.COLORMAP_INFERNO, gamma=0.6, sharpen=False,
                   bloom_strength=0.0, dual_channel=False, colormap_u=cv2.COLORMAP_COOL):
         with QMutexLocker(self.mutex):
             v_img = cp.asnumpy(self.V_src) if self.use_gpu else self.V_src.copy()
@@ -372,10 +382,12 @@ class SimulationEngine:
             colored = cv2.filter2D(colored, -1, kernel)
 
         if bloom_strength > 0:
-            bright_mask = cv2.cvtColor(colored, cv2.COLOR_BGR2GRAY)
-            _, bright_mask = cv2.threshold(bright_mask, 180, 255, cv2.THRESH_BINARY)
+            gray = cv2.cvtColor(colored, cv2.COLOR_BGR2GRAY)
+            _, bright_mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
             bloom = cv2.GaussianBlur(colored, (0, 0), 15)
-            colored = cv2.addWeighted(colored, 1.0, bloom, bloom_strength, 0)
+            mask_3ch = (bright_mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
+            colored = (colored * (1.0 - mask_3ch * bloom_strength) + bloom * mask_3ch * bloom_strength)
+            colored = np.clip(colored, 0, 255).astype(np.uint8)
 
         return cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
 
@@ -396,14 +408,14 @@ class SimulationWorker(QThread):
         self.paused = False
         self.steps_per_frame = 30
         self.target_fps = target_fps
-        
+
         self.colormap = cv2.COLORMAP_INFERNO
         self.gamma = 0.6
         self.sharpen = False
         self.bloom = 0.0
         self.dual_channel = False
         self.colormap_u = cv2.COLORMAP_COOL
-        
+
         self.auto_disturbance = True
         self.is_recording = False
         self.video_writer = None
@@ -424,31 +436,31 @@ class SimulationWorker(QThread):
                     if disturbance_timer > 150:
                         self.engine.add_random_disturbance(num_blobs=2)
                         disturbance_timer = 0
-                
+
                 img = self.engine.get_image(
                     colormap=self.colormap, gamma=self.gamma, sharpen=self.sharpen,
                     bloom_strength=self.bloom, dual_channel=self.dual_channel,
                     colormap_u=self.colormap_u
                 )
                 self.frame_ready.emit(img)
-                
+
                 if self.is_recording and self.video_writer is not None:
                     bgr_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                     self.video_writer.write(bgr_img)
                     if self.record_duration > 0 and (time.time() - self.record_start_time >= self.record_duration):
                         self.stop_recording()
-                
+
                 frames += 1
                 current_time = time.time()
                 elapsed = current_time - last_time
                 if elapsed >= 1.0:
                     fps = frames / elapsed
                     self.stats_ready.emit(fps, self.engine.width, self.engine.iteration)
-                    log.info("Stats: FPS=%.1f, iter=%d, res=%dx%d", 
+                    log.info("Stats: FPS=%.1f, iter=%d, res=%dx%d",
                              fps, self.engine.iteration, self.engine.width, self.engine.height)
                     frames = 0
                     last_time = current_time
-                
+
                 sleep_time = (1.0 / self.target_fps) - (time.time() - current_time)
                 if sleep_time > 0:
                     time.sleep(sleep_time)
@@ -456,7 +468,7 @@ class SimulationWorker(QThread):
                 time.sleep(0.1)
 
     def start_recording(self, filepath, duration=0):
-        if self.is_recording: 
+        if self.is_recording:
             log.warning("Recording already in progress, ignoring start request")
             return
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -464,7 +476,7 @@ class SimulationWorker(QThread):
         self.is_recording = True
         self.record_start_time = time.time()
         self.record_duration = duration
-        log.info("Recording started: path=%s, duration=%ds, resolution=%dx%d", 
+        log.info("Recording started: path=%s, duration=%ds, resolution=%dx%d",
                  filepath, duration if duration > 0 else -1, self.engine.width, self.engine.height)
 
     def stop_recording(self):
@@ -512,7 +524,7 @@ class PhaseDiagramWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        
+
         grad = QLinearGradient(0, 0, self.width(), self.height())
         grad.setColorAt(0.0, QColor(20, 0, 40))
         grad.setColorAt(0.4, QColor(0, 40, 40))
@@ -543,13 +555,13 @@ class FastImageViewer(QWidget):
         super().__init__()
         self.setMinimumSize(400, 400)
         self.setMouseTracking(True)
-        
+
         self.current_pixmap = QPixmap()
         self._zoom = 1.0
         self._pan = QPointF(0, 0)
         self._last_mouse_pos = QPointF()
         self._is_panning = False
-        
+
         self.drawing = False
         self.brush_radius = 10
         self.brush_strength = 0.5
@@ -557,7 +569,8 @@ class FastImageViewer(QWidget):
     def update_image(self, rgb_array):
         h, w, ch = rgb_array.shape
         bytes_per_line = ch * w
-        q_img = QImage(rgb_array.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        self._img_ref = np.ascontiguousarray(rgb_array)
+        q_img = QImage(self._img_ref.data, w, h, bytes_per_line, QImage.Format_RGB888)
         self.current_pixmap = QPixmap.fromImage(q_img)
         self.update()
 
@@ -565,13 +578,13 @@ class FastImageViewer(QWidget):
         if self.current_pixmap.isNull(): return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        
+
         target_rect = self.rect()
         source_size = self.current_pixmap.size() * self._zoom
-        
+
         dx = (target_rect.width() - source_size.width()) / 2 + self._pan.x()
         dy = (target_rect.height() - source_size.height()) / 2 + self._pan.y()
-        
+
         painter.translate(dx, dy)
         painter.scale(self._zoom, self._zoom)
         painter.drawPixmap(0, 0, self.current_pixmap)
@@ -611,10 +624,10 @@ class FastImageViewer(QWidget):
         source_size = self.current_pixmap.size() * self._zoom
         dx = (target_rect.width() - source_size.width()) / 2 + self._pan.x()
         dy = (target_rect.height() - source_size.height()) / 2 + self._pan.y()
-        
+
         local_x = (event.position().x() - dx) / self._zoom
         local_y = (event.position().y() - dy) / self._zoom
-        
+
         if 0 <= local_x < self.current_pixmap.width() and 0 <= local_y < self.current_pixmap.height():
             self.paint_signal.emit(int(local_x), int(local_y), self.brush_radius, self.brush_strength)
 
@@ -632,9 +645,12 @@ class ControlPanel(QWidget):
     load_state_clicked = Signal()
     export_snap_clicked = Signal()
     import_seed_clicked = Signal()
+    brush_settings_changed = Signal(int, float)
+    preset_selected = Signal(str)
 
     def __init__(self):
         super().__init__()
+        self._preset_applying = False  # FIX: guard to prevent duplicate emits during preset load
         self.init_ui()
 
     def init_ui(self):
@@ -644,7 +660,7 @@ class ControlPanel(QWidget):
         layout = QVBoxLayout(container)
         layout.setSpacing(8)
         scroll.setWidget(container)
-        
+
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0,0,0,0)
         main_layout.addWidget(scroll)
@@ -727,27 +743,28 @@ class ControlPanel(QWidget):
         # Physics Parameters
         param_group = QGroupBox("Physics Parameters")
         form = QFormLayout()
-        
+
         self.spin_F = QDoubleSpinBox(); self.spin_F.setRange(0.001, 0.1); self.spin_F.setSingleStep(0.001); self.spin_F.setValue(0.0545); self.spin_F.setDecimals(4)
         self.spin_k = QDoubleSpinBox(); self.spin_k.setRange(0.001, 0.1); self.spin_k.setSingleStep(0.001); self.spin_k.setValue(0.0620); self.spin_k.setDecimals(4)
-        
+
         self.combo_bc = QComboBox(); self.combo_bc.addItems(BOUNDARIES)
         self.check_9pt = QCheckBox("9-Point Laplacian")
-        
+
         form.addRow("Feed (F):", self.spin_F)
         form.addRow("Kill (k):", self.spin_k)
         form.addRow("Boundary:", self.combo_bc)
         form.addRow(self.check_9pt)
-        
+
+        # Anisotropy
         form.addRow(QLabel("Anisotropy (X/Y):"))
         self.spin_Du_x = QDoubleSpinBox(); self.spin_Du_x.setRange(0.01, 1.0); self.spin_Du_x.setSingleStep(0.01); self.spin_Du_x.setValue(0.20)
         self.spin_Du_y = QDoubleSpinBox(); self.spin_Du_y.setRange(0.01, 1.0); self.spin_Du_y.setSingleStep(0.01); self.spin_Du_y.setValue(0.20)
         self.spin_Dv_x = QDoubleSpinBox(); self.spin_Dv_x.setRange(0.01, 1.0); self.spin_Dv_x.setSingleStep(0.01); self.spin_Dv_x.setValue(0.10)
         self.spin_Dv_y = QDoubleSpinBox(); self.spin_Dv_y.setRange(0.01, 1.0); self.spin_Dv_y.setSingleStep(0.01); self.spin_Dv_y.setValue(0.10)
-        
+
         form.addRow("Du_x:", self.spin_Du_x); form.addRow("Du_y:", self.spin_Du_y)
         form.addRow("Dv_x:", self.spin_Dv_x); form.addRow("Dv_y:", self.spin_Dv_y)
-        
+
         param_group.setLayout(form)
         layout.addWidget(param_group)
 
@@ -790,7 +807,7 @@ class ControlPanel(QWidget):
 
         self.phase_widget = PhaseDiagramWidget()
         preset_layout.addWidget(self.phase_widget)
-        
+
         preset_group.setLayout(preset_layout)
         layout.addWidget(preset_group)
         layout.addStretch()
@@ -800,7 +817,7 @@ class ControlPanel(QWidget):
         self.btn_load.clicked.connect(self.load_state_clicked.emit)
         self.btn_snap.clicked.connect(self.export_snap_clicked.emit)
         self.btn_import_seed.clicked.connect(self.import_seed_clicked.emit)
-        
+
         self.btn_start.clicked.connect(self.on_start_toggle)
         self.btn_reset.clicked.connect(self.sim_reset_clicked.emit)
         self.btn_clear.clicked.connect(self.clear_clicked.emit)
@@ -814,13 +831,14 @@ class ControlPanel(QWidget):
         for w in [self.check_auto, self.check_sharpen, self.check_dual, self.check_9pt]:
             w.stateChanged.connect(self.emit_params)
 
-        self.combo_res.currentTextChanged.connect(self.on_res_change)
+        self.combo_res.currentIndexChanged.connect(self.on_res_change)
         self.combo_preset.currentTextChanged.connect(self.load_preset)
         self.slider_brush.valueChanged.connect(self.on_brush_change)
+        self.slider_strength.valueChanged.connect(self.on_brush_change)
 
         self.btn_rec_start.clicked.connect(self.on_rec_start)
         self.btn_rec_stop.clicked.connect(self.rec_stop_clicked.emit)
-        
+
         self.phase_widget.params_clicked.connect(self.on_phase_click)
 
     def _create_slider(self, label_text, slider_attr, min_val, max_val, default, label_attr):
@@ -831,7 +849,7 @@ class ControlPanel(QWidget):
         slider.setValue(default)
         h.addWidget(slider)
         setattr(self, slider_attr, slider)
-        
+
         if label_attr is not None:
             lbl = QLabel(str(default))
             h.addWidget(lbl)
@@ -839,10 +857,13 @@ class ControlPanel(QWidget):
             slider.valueChanged.connect(lambda v, l=lbl: l.setText(str(v)))
         return h
 
-    def on_brush_change(self, val): pass
+    def on_brush_change(self, val):
+        strength = self.slider_strength.value() / 100.0
+        self.brush_settings_changed.emit(val, strength)
 
-    def on_res_change(self, text):
-        res = int(text.split(" ")[0])
+    def on_res_change(self, idx):
+        res_map = {0: 256, 1: 512, 2: 1024}
+        res = res_map.get(idx, 512)
         log.info("Resolution change requested: %d", res)
         self.resolution_changed.emit(res)
 
@@ -859,6 +880,9 @@ class ControlPanel(QWidget):
         self.spin_k.setValue(k)
 
     def emit_params(self):
+        # FIX: suppress intermediate emits while a preset is being applied
+        if self._preset_applying:
+            return
         d = {
             'F': self.spin_F.value(), 'k': self.spin_k.value(),
             'speed': self.spin_speed.value(),
@@ -877,7 +901,7 @@ class ControlPanel(QWidget):
             'F_gradient': self.slider_fgrad.value() / 100.0 if self.slider_fgrad.value() > 0 else None,
             'k_gradient': self.slider_kgrad.value() / 100.0 if self.slider_kgrad.value() > 0 else None,
         }
-        log.debug("Params emitted: F=%.4f k=%.4f speed=%d Du=(%.2f,%.2f) Dv=(%.2f,%.2f) bc=%d 9pt=%s noise=%.5f", 
+        log.debug("Params emitted: F=%.4f k=%.4f speed=%d Du=(%.2f,%.2f) Dv=(%.2f,%.2f) bc=%d 9pt=%s noise=%.5f",
                   d['F'], d['k'], d['speed'], d['Du_x'], d['Du_y'], d['Dv_x'], d['Dv_y'],
                   d['boundary'], d['use_9pt'], d['noise_level'])
         self.params_changed.emit(d)
@@ -885,12 +909,22 @@ class ControlPanel(QWidget):
     def load_preset(self, name):
         if name in PRESETS:
             f, k = PRESETS[name]
+            log.info("Preset '%s' selected: F=%.4f, k=%.4f", name, f, k)
+
+            # FIX: block intermediate param emits while setting both F and k
+            self._preset_applying = True
             self.spin_F.setValue(f)
             self.spin_k.setValue(k)
-            log.info("Preset loaded: %s (F=%.4f, k=%.4f)", name, f, k)
+            self._preset_applying = False
 
-    def on_rec_start(self): 
+            # FIX: emit params once with correct F and k together, then trigger reset
+            self.emit_params()
+            self.preset_selected.emit(name)
+
+
+    def on_rec_start(self):
         self.rec_start_clicked.emit("", 0)
+
     def set_recording_state(self, is_rec):
         if is_rec:
             self.btn_rec_start.setEnabled(False); self.btn_rec_stop.setEnabled(True)
@@ -947,13 +981,15 @@ class MainWindow(QMainWindow):
         self.control_panel.resolution_changed.connect(self.change_resolution)
         self.control_panel.rec_start_clicked.connect(self.start_recording)
         self.control_panel.rec_stop_clicked.connect(self.stop_recording)
-        
+        self.control_panel.preset_selected.connect(self.on_preset_selected)
+
         self.control_panel.save_state_clicked.connect(self.save_state)
         self.control_panel.load_state_clicked.connect(self.load_state)
         self.control_panel.export_snap_clicked.connect(self.export_snapshot)
         self.control_panel.import_seed_clicked.connect(self.import_seed_image)
 
         self.viewer.paint_signal.connect(self.paint_sim)
+        self.control_panel.brush_settings_changed.connect(self.on_brush_settings_changed)
 
         mode = "GPU (CuPy)" if self.use_gpu else "CPU (Numba Optimized)"
         self.control_panel.mode_label.setText(f"Engine: {mode}")
@@ -966,6 +1002,12 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def update_params(self, p):
+        # FIX: track whether F or k changed so we always rebuild fields
+        f_changed = self.engine.F != p['F']
+        k_changed = self.engine.k != p['k']
+        fgrad_changed = self.engine.F_gradient != p['F_gradient']
+        kgrad_changed = self.engine.k_gradient != p['k_gradient']
+
         self.engine.F = p['F']
         self.engine.k = p['k']
         self.engine.Du_x = p['Du_x']; self.engine.Du_y = p['Du_y']
@@ -973,11 +1015,10 @@ class MainWindow(QMainWindow):
         self.engine.boundary = p['boundary']
         self.engine.use_9pt = p['use_9pt']
         self.engine.noise_level = p['noise_level']
-        
-        if self.engine.F_gradient != p['F_gradient']:
+
+        # Rebuild F_field/k_field once when F, k, or their gradients change
+        if f_changed or k_changed or fgrad_changed or kgrad_changed:
             self.engine.F_gradient = p['F_gradient']
-            self.engine._rebuild_gradients()
-        if self.engine.k_gradient != p['k_gradient']:
             self.engine.k_gradient = p['k_gradient']
             self.engine._rebuild_gradients()
 
@@ -994,6 +1035,10 @@ class MainWindow(QMainWindow):
         self.control_panel.phase_widget.current_k = p['k']
         self.control_panel.phase_widget.update()
 
+    def on_brush_settings_changed(self, radius, strength):
+        self.viewer.brush_radius = radius
+        self.viewer.brush_strength = strength
+
     def paint_sim(self, x, y, radius, strength):
         self.engine.paint(x, y, radius=radius, strength=strength)
 
@@ -1009,7 +1054,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Paused")
         log.info("Simulation paused")
 
-    def clear_sim(self): 
+    def clear_sim(self):
         self.engine.clear()
 
     def change_resolution(self, res):
@@ -1018,12 +1063,11 @@ class MainWindow(QMainWindow):
         if was_running: self.worker.stop()
         self.current_res = res
         self.engine = SimulationEngine(res, res, use_gpu=self.use_gpu)
-        
+
         self.worker = SimulationWorker(self.engine, target_fps=60)
         self.worker.frame_ready.connect(self.viewer.update_image)
         self.worker.stats_ready.connect(self.update_status)
         self.worker.recording_stopped.connect(self.on_rec_stopped)
-        self.viewer.paint_signal.connect(self.paint_sim)
         self.control_panel.emit_params()
         if was_running: self.worker.start()
         log.info("Resolution change complete: %dx%d", res, res)
@@ -1032,12 +1076,39 @@ class MainWindow(QMainWindow):
         self.worker.paused = True
         seed_text = self.control_panel.combo_seed.currentText()
         self.engine.reset(seed=seed_text)
-        img = self.engine.get_image()
+        img = self.engine.get_image(
+            colormap=self.worker.colormap, gamma=self.worker.gamma,
+            sharpen=self.worker.sharpen, bloom_strength=self.worker.bloom,
+            dual_channel=self.worker.dual_channel, colormap_u=self.worker.colormap_u
+        )
         self.viewer.update_image(img)
         self.control_panel.btn_start.setChecked(False)
         self.control_panel.btn_start.setText("▶ Start")
         self.statusBar().showMessage("Reset Complete")
         log.info("Simulation reset with seed='%s'", seed_text)
+
+    # FIX: new handler — apply preset params then reset so the pattern develops from scratch
+    def on_preset_selected(self, name):
+        log.info("Preset '%s' applied — resetting simulation", name)
+        seed_text = self.control_panel.combo_seed.currentText()
+        self.engine.reset(seed=seed_text)
+
+        # Show the fresh state immediately
+        img = self.engine.get_image(
+            colormap=self.worker.colormap, gamma=self.worker.gamma,
+            sharpen=self.worker.sharpen, bloom_strength=self.worker.bloom,
+            dual_channel=self.worker.dual_channel, colormap_u=self.worker.colormap_u
+        )
+        self.viewer.update_image(img)
+
+        # Auto-start so the user immediately sees the pattern evolve
+        self.worker.paused = False
+        if not self.worker.isRunning():
+            self.worker.start()
+        self.control_panel.btn_start.setChecked(True)
+        self.control_panel.btn_start.setText("⏸ Pause")
+        self.statusBar().showMessage(f"Preset: {name}")
+        log.info("Preset '%s' running with seed='%s'", name, seed_text)
 
     def save_state(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save State", "", "NumPy (*.npz)")
@@ -1046,9 +1117,14 @@ class MainWindow(QMainWindow):
                 path += '.npz'
             u = cp.asnumpy(self.engine.U_src) if self.use_gpu else self.engine.U_src
             v = cp.asnumpy(self.engine.V_src) if self.use_gpu else self.engine.V_src
-            np.savez_compressed(path, U=u, V=v, F=self.engine.F, k=self.engine.k, 
+            np.savez_compressed(path, U=u, V=v, F=self.engine.F, k=self.engine.k,
                                 Du_x=self.engine.Du_x, Du_y=self.engine.Du_y,
-                                Dv_x=self.engine.Dv_x, Dv_y=self.engine.Dv_y)
+                                Dv_x=self.engine.Dv_x, Dv_y=self.engine.Dv_y,
+                                noise_level=self.engine.noise_level,
+                                boundary=self.engine.boundary,
+                                use_9pt=self.engine.use_9pt,
+                                F_gradient=self.engine.F_gradient if self.engine.F_gradient is not None else -1.0,
+                                k_gradient=self.engine.k_gradient if self.engine.k_gradient is not None else -1.0)
             log.info("State saved: %s (F=%.4f, k=%.4f)", path, self.engine.F, self.engine.k)
         else:
             log.debug("Save state cancelled by user")
@@ -1058,26 +1134,50 @@ class MainWindow(QMainWindow):
         if path:
             was_running = self.worker.isRunning()
             if was_running: self.worker.stop()
-            
+
             try:
                 data = np.load(path)
+                if data['U'].shape != (self.engine.height, self.engine.width):
+                    log.error("Loaded state resolution mismatch: expected %dx%d, got %s",
+                              self.engine.width, self.engine.height, data['U'].shape)
+                    if was_running: self.worker.start()
+                    return
+
                 lib = cp if self.use_gpu else np
                 self.engine.U_src = lib.array(data['U']); self.engine.V_src = lib.array(data['V'])
                 self.engine.U_dst = lib.array(data['U']); self.engine.V_dst = lib.array(data['V'])
                 self.engine.F = float(data['F']); self.engine.k = float(data['k'])
                 self.engine.Du_x = float(data['Du_x']); self.engine.Du_y = float(data['Du_y'])
                 self.engine.Dv_x = float(data['Dv_x']); self.engine.Dv_y = float(data['Dv_y'])
+
+                if 'noise_level' in data:
+                    self.engine.noise_level = float(data['noise_level'])
+                if 'boundary' in data:
+                    self.engine.boundary = int(data['boundary'])
+                if 'use_9pt' in data:
+                    self.engine.use_9pt = bool(data['use_9pt'])
+                if 'F_gradient' in data:
+                    fg = float(data['F_gradient'])
+                    self.engine.F_gradient = fg if fg >= 0 else None
+                if 'k_gradient' in data:
+                    kg = float(data['k_gradient'])
+                    self.engine.k_gradient = kg if kg >= 0 else None
+
                 self.engine._rebuild_gradients()
-                
+
                 self.control_panel.spin_F.setValue(self.engine.F)
                 self.control_panel.spin_k.setValue(self.engine.k)
-                
-                log.info("State loaded: %s (F=%.4f, k=%.4f, Du=(%.2f,%.2f), Dv=(%.2f,%.2f))", 
-                         path, self.engine.F, self.engine.k, 
+                self.control_panel.spin_Du_x.setValue(self.engine.Du_x)
+                self.control_panel.spin_Du_y.setValue(self.engine.Du_y)
+                self.control_panel.spin_Dv_x.setValue(self.engine.Dv_x)
+                self.control_panel.spin_Dv_y.setValue(self.engine.Dv_y)
+
+                log.info("State loaded: %s (F=%.4f, k=%.4f, Du=(%.2f,%.2f), Dv=(%.2f,%.2f))",
+                         path, self.engine.F, self.engine.k,
                          self.engine.Du_x, self.engine.Du_y, self.engine.Dv_x, self.engine.Dv_y)
             except Exception as e:
                 log.error("Failed to load state: %s - %s", path, e)
-            
+
             if was_running: self.worker.start()
         else:
             log.debug("Load state cancelled by user")
@@ -1087,7 +1187,7 @@ class MainWindow(QMainWindow):
         if path:
             if not path.endswith('.png'):
                 path += '.png'
-            img = self.engine.get_image(self.worker.colormap, self.worker.gamma, self.worker.sharpen, 
+            img = self.engine.get_image(self.worker.colormap, self.worker.gamma, self.worker.sharpen,
                                         self.worker.bloom, self.worker.dual_channel, self.worker.colormap_u)
             cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
             log.info("Snapshot exported: %s", path)
@@ -1109,7 +1209,7 @@ class MainWindow(QMainWindow):
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath = f"rd_sim_{timestamp}.mp4"
             fn, _ = QFileDialog.getSaveFileName(self, "Save Video", filepath, "MP4 Files (*.mp4)")
-            if not fn: 
+            if not fn:
                 log.debug("Recording cancelled by user")
                 return
             filepath = fn
@@ -1119,8 +1219,9 @@ class MainWindow(QMainWindow):
         self.worker.start_recording(filepath, duration)
         self.control_panel.set_recording_state(True)
 
-    def stop_recording(self): 
+    def stop_recording(self):
         self.worker.stop_recording()
+
     def on_rec_stopped(self):
         self.control_panel.set_recording_state(False)
         self.statusBar().showMessage("Recording Saved.")
@@ -1147,7 +1248,7 @@ if __name__ == "__main__":
     log.info("CuPy available: %s", GPU_AVAILABLE)
     log.info("Numba available: %s", NUMBA_AVAILABLE)
     log.info("=" * 60)
-    
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
